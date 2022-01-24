@@ -41,3 +41,13 @@ def initialize(arch, in_size, hidden_size, out_size, scale, dtype):
         vbs.append(lvbs)
 
     return ws, mws, vws, bs, mbs, vbs
+
+
+def copy_tensor_arrays(*tensor_arrays):
+    results = []
+    for tensor_array in tensor_arrays:
+        cp = []
+        for tensor in tensor_array:
+            cp.append(np.array(tensor, copy=True))
+        results.append(cp)
+    return results
