@@ -10,6 +10,15 @@ def mat_to_coo(data):
     return np.array(result)
 
 
+def adj_to_coo(e):
+    (ei, ev) = e
+    result = []
+    for i in range(ei.shape[1]):
+        row, col = ei[0][i], ei[1][i]
+        result.append([row, col, ev[i]])
+    return np.array(result)
+
+
 def coo_tile(coo, pe, tile_size):
     density = [0 for _ in range(pe)]
     num_rows, num_cols = np.max(coo[:, 0]) + 1, np.max(coo[:, 1]) + 1
@@ -82,7 +91,7 @@ def resolve_collision(pcoo, weight_partition=128):
 
     empty = True
     for i in range(row_blk_size):
-        if out_row[i] is None:
+        if out_row[i] is None or len(out_row[i]) == 0:
             out_row[i] = [0, 0, 0]
         else:
             empty = False

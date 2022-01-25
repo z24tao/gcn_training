@@ -1,10 +1,6 @@
 from src.int import *
 
 
-def divide(n, d):
-    return np.divide(n, d, out=np.zeros_like(n), where=d != 0)
-
-
 def dense(e, ifm, w, b, relu=True, prune=None):
     if prune is not None:
         w[abs(w) < prune] = 0
@@ -30,12 +26,6 @@ def q_dense(e, ifm, w, b, relu, prune, precision):
     if relu:
         return np.maximum(h, 0), agg_fl, ofm_fl
     return h, agg_fl, ofm_fl
-
-
-def relu_grad(ifm, grad_ifm):
-    out = np.array(grad_ifm, copy=True)
-    out[ifm <= 0] = 0
-    return out
 
 
 def dense_grad(e, ifm, w, ofm, grad_ofm, relu=True, prune=None):
@@ -64,17 +54,18 @@ def q_dense_grad(e, ifm, w, ofm, grad_ofm, relu=True, prune=None, precision=16):
     grad_b = np.sum(grad_ofm, axis=0)
 
     h = grad_ofm
+    gafl = 0
     if e is not None:
         h = aggregate(e, grad_ofm)
-        h, _ = search_quantize(h, wl=precision)
+        h, gafl = search_quantize(h, wl=precision)
 
     grad_w = ifm.T @ h
     grad_x = h @ w.T
 
-    grad_x, _ = search_quantize(grad_x, wl=precision)
-    grad_w, _ = search_quantize(grad_w, wl=precision)
-    grad_b, _ = search_quantize(grad_b, wl=precision*2)
-    return grad_x, grad_w, grad_b
+    grad_x, gfmfl = search_quantize(grad_x, wl=precision)
+    grad_w, gwfl = search_quantize(grad_w, wl=precision)
+    grad_b, gbfl = search_quantize(grad_b, wl=precision*2)
+    return grad_x, grad_w, grad_b, gafl, gfmfl, gwfl, gbfl
 
 
 def norm(x):
@@ -117,10 +108,3 @@ def adam_update(x, m, v, g, eta, beta1, beta2):
     m = beta1 * m + (1 - beta1) * g
     v = beta2 * v + (1 - beta2) * g ** 2
     return x - eta * divide(m, np.sqrt(v)), m, v
-
-
-def q_adam_update(x, m, v, g, eta, beta1, beta2, precision):
-    m = beta1 * m + (1 - beta1) * g
-    v = beta2 * v + (1 - beta2) * g ** 2
-    x, _ = search_quantize(x - eta * divide(m, np.sqrt(v)), precision)
-    return x, m, v

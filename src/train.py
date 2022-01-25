@@ -1,6 +1,6 @@
-from src.data import *
 from src.float import *
 from src.int import *
+from src.output import *
 from src.param import *
 
 np.random.seed(42)
@@ -9,7 +9,8 @@ eta, beta1, beta2 = 0.01, 0.9, 0.999
 
 # arch: number of aggregators per layer, see below:
 #   https://github.com/GraphSAINT/GraphSAINT/blob/master/train_config/table2/reddit2_rw.yml#L5
-def train(name, epochs, arch, in_size, hidden_size, out_size, scale=0.75, prune=None, multi_class=False, precision=16):
+def train(name, epochs, arch, in_size, hidden_size, out_size, scale=0.75, prune=None, multi_class=False, precision=16,
+          apply_quantization=False):
     arch = [a + 1 for a in arch]
     arch.append(1)  # for the classifier
     ws, mws, vws, bs, mbs, vbs = initialize(arch, in_size, hidden_size, out_size, scale, np.float64)
@@ -20,22 +21,27 @@ def train(name, epochs, arch, in_size, hidden_size, out_size, scale=0.75, prune=
 
     for epoch in range(epochs):
         x, e, y, nl = load_epoch(name, epoch)
-        qx, ix, xfl, qe, ie, efl = quantize_input(x, e, precision)
-
         fms, norm_denom = forward(arch, x, e, ws, bs, prune)
+        evaluate(epoch, fms[-1][-1], y, multi_class)
+        grad_ws, grad_bs = backward(arch, e, x, fms, ws, y, nl, norm_denom, prune, multi_class)
+        ws, mws, vws, bs, mbs, vbs = adam(arch, ws, mws, vws, bs, mbs, vbs, grad_ws, grad_bs)
+
+        if not apply_quantization:
+            continue
+
+        qx, ix, xfl, qe, ie, efl = quantize_input(x, e, precision)
         qfms, q_norm_denom, agg_fls, fm_fls, nfl = q_forward(arch, qx, qe, qws, qbs, prune, precision)
         ifms, i_norm_denom = i_forward(arch, ix, ie, iws, ibs, xfl, efl, wfls, bfls, agg_fls, fm_fls, nfl, prune,
                                        precision)
-
-        evaluate(epoch, fms[-1][-1], y, multi_class)
         evaluate(epoch, qfms[-1][-1], y, multi_class)
         evaluate(epoch, ifms[-1][-1], y, multi_class)
-
-        grad_ws, grad_bs = backward(arch, e, x, fms, ws, y, nl, norm_denom, prune, multi_class)
-        grad_qws, grad_qbs = q_backward(arch, qe, qx, qfms, qws, y, nl, q_norm_denom, prune, multi_class, precision)
-
-        ws, mws, vws, bs, mbs, vbs = adam(arch, ws, mws, vws, bs, mbs, vbs, grad_ws, grad_bs)
+        grad_qws, grad_qbs, gafls, gfmfls, gwfls, gbfls, gnfl = \
+            q_backward(arch, qe, qx, qfms, qws, y, nl, q_norm_denom, prune, multi_class, precision)
+        grad_iws, grad_ibs = i_backward(arch, epoch, ie, ix, ifms, iws, ibs, y, nl, i_norm_denom, efl, xfl, wfls, nfl,
+                                        fm_fls, gafls, gfmfls, gwfls, gbfls, gnfl, prune, multi_class, precision)
         qws, qmws, qvws, qbs, qmbs, qvbs = q_adam(arch, qws, qmws, qvws, qbs, qmbs, qvbs, grad_qws, grad_qbs, precision)
+        iws, imws, ivws, ibs, imbs, ivbs = i_adam(arch, iws, imws, ivws, ibs, imbs, ivbs, grad_iws, grad_ibs,
+                                                  wfls, bfls, gwfls, gbfls, precision)
 
 
 def quantize_params(ws, precision):
@@ -165,7 +171,6 @@ def i_forward(arch, x, e, ws, bs, xfl, efl, wfls, bfls, agg_fls, fm_fls, nfl, pr
             h, norm_denom = norm(full_precision_fm)
             h = int_quantize(h, nfl, precision)
             layer_fms.append(h)
-            fm_fls.append(nfl)
 
         fms.append(layer_fms)
 
@@ -205,6 +210,7 @@ def dense_grad_params(arch, layer, layer_size, agg, e, fms, ws, grad_fms):
     w = ws[layer][agg]
     output_size = int(fms[layer][-1].shape[1] / layer_size)
     ofm = fms[layer][-1][:, (agg * output_size):((agg + 1) * output_size)]
+    # print(layer, grad_fms[layer])
     grad_ofm = grad_fms[layer][:, (agg * output_size):((agg + 1) * output_size)]
     relu = layer != len(arch) - 1
     return layer_e, w, ofm, grad_ofm, relu
@@ -236,7 +242,74 @@ def backward(arch, e, x, fms, ws, y, nl, norm_denom, prune, multi_class):
 
 def q_backward(arch, e, x, fms, ws, y, nl, norm_denom, prune, multi_class, precision):
     grad_fms, grad_ws, grad_bs = backward_start(arch, fms, y, nl, multi_class)
-    grad_fms[-1], _ = search_quantize(grad_fms[-1], precision)
+    gafls, gfmfls, gwfls, gbfls = [[] for _ in arch], [0 for _ in arch], [[] for _ in arch], [[] for _ in arch]
+    grad_fms[-1], gfmfls[-1] = search_quantize(grad_fms[-1], precision)
+    gnfl = 0
+
+    for layer in range(len(arch)-1, -1, -1):
+        layer_size = arch[layer]
+        ifm = fms[layer - 1][-1] if layer > 0 else x
+        grad_ifm = np.zeros_like(ifm)
+        layer_gafl, layer_gwfl, layer_gbfl = [], [], []
+        layer_gfmfl = 0
+
+        for agg in range(layer_size):
+            layer_e, w, ofm, grad_ofm, relu = dense_grad_params(arch, layer, layer_size, agg, e, fms, ws, grad_fms)
+            grad_agg, grad_w, grad_b, gafl, gfmfl, gwfl, gbfl = \
+                q_dense_grad(layer_e, ifm, w, ofm, grad_ofm, relu, prune)
+
+            grad_ws[layer].append(grad_w)
+            grad_bs[layer].append(grad_b)
+
+            layer_gafl.append(gafl)
+            layer_gfmfl = gfmfl
+            layer_gwfl.append(gwfl)
+            layer_gbfl.append(gbfl)
+            grad_ifm += grad_agg
+            # if layer == 0:
+            #     print('q', grad_w * (2 ** gwfl))
+
+        if layer > 0:
+            grad_fms[layer-1] = grad_ifm
+            gfmfls[layer-1] = layer_gfmfl
+
+        if layer == len(arch)-1:
+            grad_fms[layer-1] = norm_grad(fms[layer-1][0], norm_denom, grad_fms[layer-1])
+            grad_fms[layer-1], gnfl = search_quantize(grad_fms[layer-1], precision)
+
+        gafls[layer] = layer_gafl
+        gwfls[layer] = layer_gwfl
+        gbfls[layer] = layer_gbfl
+
+    return grad_ws, grad_bs, gafls, gfmfls, gwfls, gbfls, gnfl
+
+
+def i_backward_start(arch, fms, y, nl, fm_fls, gfmfls, precision, multi_class):
+    fms[-1][-1] = fms[-1][-1].astype(np.float64) / (2 ** fm_fls[-1][-1])
+    grad_fms, grad_ws, grad_bs = backward_start(arch, fms, y, nl, multi_class)
+    grad_fms[-1] = int_quantize(grad_fms[-1], gfmfls[-1], precision)
+    return grad_fms, grad_ws, grad_bs
+
+
+def i_dense_grad_params(arch, layer, agg, xfl, wfls, fm_fls, nfl, gafls, gfmfls, gwfls, gbfls, gnfl):
+    ifmfl = xfl if layer == 0 else fm_fls[layer - 1][-1]
+    if layer == len(arch) - 1:
+        ifmfl = nfl
+    gifmfl = 0 if layer == 0 else gfmfls[layer-1]
+    wfl = wfls[layer][agg]
+    gafl = gafls[layer][agg]
+    gwfl = gwfls[layer][agg]
+    gbfl = gbfls[layer][agg]
+    gofmfl = gfmfls[layer]
+    if layer == len(arch) - 2:
+        gofmfl = gnfl
+    return ifmfl, wfl, gafl, gifmfl, gwfl, gbfl, gofmfl
+
+
+def i_backward(arch, epoch, e, x, fms, ws, bs, y, nl, norm_denom, efl, xfl, wfls, nfl, fm_fls, gafls, gfmfls,
+               gwfls, gbfls, gnfl, prune, multi_class, precision):
+    grad_fms, grad_ws, grad_bs = i_backward_start(arch, fms, y, nl, fm_fls, gfmfls, precision, multi_class)
+    preprocess(epoch, x, ws, bs, e, grad_fms[-1][-1])
 
     for layer in range(len(arch)-1, -1, -1):
         layer_size = arch[layer]
@@ -245,17 +318,24 @@ def q_backward(arch, e, x, fms, ws, y, nl, norm_denom, prune, multi_class, preci
 
         for agg in range(layer_size):
             layer_e, w, ofm, grad_ofm, relu = dense_grad_params(arch, layer, layer_size, agg, e, fms, ws, grad_fms)
-            grad_agg, grad_w, grad_b = q_dense_grad(layer_e, ifm, w, ofm, grad_ofm, relu, prune)
+            ifmfl, wfl, gafl, gifmfl, gwfl, gbfl, gofmfl = \
+                i_dense_grad_params(arch, layer, agg, xfl, wfls, fm_fls, nfl, gafls, gfmfls, gwfls, gbfls, gnfl)
+            grad_agg, grad_w, grad_b = i_dense_grad(layer_e, ifm, w, ofm, grad_ofm, efl, ifmfl, wfl, gafl, gifmfl,
+                                                    gwfl, gbfl, gofmfl, relu, prune, precision)
             grad_ws[layer].append(grad_w)
             grad_bs[layer].append(grad_b)
             grad_ifm += grad_agg
+            # if layer == 0:
+            #     print('i', grad_w)
 
         if layer > 0:
             grad_fms[layer-1] = grad_ifm
 
         if layer == len(arch)-1:
-            grad_fms[layer-1] = norm_grad(fms[layer-1][0], norm_denom, grad_fms[layer-1])
-            grad_fms[layer-1], _ = search_quantize(grad_fms[layer-1], precision)
+            full_precision_fm = fms[layer-1][0].astype(np.float64) / (2.0 ** fm_fls[layer-1][0])
+            full_precision_grad_fm = grad_fms[layer-1].astype(np.float64) / (2.0 ** gfmfls[layer-1])
+            grad_fms[layer-1] = norm_grad(full_precision_fm, norm_denom, full_precision_grad_fm)
+            grad_fms[layer-1] = int_quantize(grad_fms[layer-1], gnfl, precision)
 
     return grad_ws, grad_bs
 
@@ -275,10 +355,22 @@ def adam(arch, ws, mws, vws, bs, mbs, vbs, grad_ws, grad_bs):
 def q_adam(arch, ws, mws, vws, bs, mbs, vbs, grad_ws, grad_bs, precision):
     for layer, layer_size in enumerate(arch):
         for agg in range(layer_size):
+            ws[layer][agg], mws[layer][agg], vws[layer][agg], _ = \
+                q_adam_update(ws[layer][agg], mws[layer][agg], vws[layer][agg], grad_ws[layer][agg],
+                              eta, beta1, beta2, precision)
+            bs[layer][agg], mbs[layer][agg], vbs[layer][agg], _ = \
+                q_adam_update(bs[layer][agg], mbs[layer][agg], vbs[layer][agg], grad_bs[layer][agg],
+                              eta, beta1, beta2, precision * 2)
+    return ws, mws, vws, bs, mbs, vbs
+
+
+def i_adam(arch, ws, mws, vws, bs, mbs, vbs, grad_ws, grad_bs, wfls, bfls, gwfls, gbfls, precision):
+    for layer, layer_size in enumerate(arch):
+        for agg in range(layer_size):
             ws[layer][agg], mws[layer][agg], vws[layer][agg] = \
-                q_adam_update(ws[layer][agg], mws[layer][agg], vws[layer][agg],
-                              grad_ws[layer][agg], eta, beta1, beta2, precision)
+                i_adam_update(ws[layer][agg], mws[layer][agg], vws[layer][agg], grad_ws[layer][agg],
+                              wfls[layer][agg], gwfls[layer][agg], eta, beta1, beta2, precision)
             bs[layer][agg], mbs[layer][agg], vbs[layer][agg] = \
-                q_adam_update(bs[layer][agg], mbs[layer][agg], vbs[layer][agg],
-                              grad_bs[layer][agg], eta, beta1, beta2, precision * 2)
+                i_adam_update(bs[layer][agg], mbs[layer][agg], vbs[layer][agg], grad_bs[layer][agg],
+                              bfls[layer][agg], gbfls[layer][agg], eta, beta1, beta2, precision * 2)
     return ws, mws, vws, bs, mbs, vbs

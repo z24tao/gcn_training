@@ -32,7 +32,7 @@ def preprocess(epoch, x, ws, bs, e, g, tile_size=128, row_blk_size=16, weight_pa
     fa, hl, bl = [[] for _ in slr_div], [[] for _ in slr_div[:-1]], [[] for _ in slr_div[:-1]]
 
     x_tiles = coo_tile(mat_to_coo(x), slr_div[-1], tile_size)
-    e_tiles = coo_tile(mat_to_coo(e), slr_div[-1], tile_size)
+    e_tiles = coo_tile(adj_to_coo(e), slr_div[-1], tile_size)
 
     for slr, pe_start, pe_end in zip(range(len(slr_div)-1), slr_div[:-1], slr_div[1:]):
         for pe_data in x_tiles[pe_start:pe_end]:
@@ -55,11 +55,16 @@ def preprocess(epoch, x, ws, bs, e, g, tile_size=128, row_blk_size=16, weight_pa
                 hl[slr].append(tile_header_len)
                 bl[slr].append(tile_body_len)
 
-    for w in ws:
+    flat_ws, flat_bs = [], []
+    for lws, lbs in zip(ws, bs):
+        flat_ws.extend(lws)
+        flat_bs.extend(lbs)
+
+    for w in flat_ws:
         fa[-1].append(len(fs[-1]) * 4)
         fs[-1] += to_hex(w, precision, line_len)
 
-    for b in bs:
+    for b in flat_bs:
         fa[-1].append(len(fs[-1]) * 4)
         fs[-1] += to_hex(b, precision * 2, line_len)
 
@@ -67,16 +72,16 @@ def preprocess(epoch, x, ws, bs, e, g, tile_size=128, row_blk_size=16, weight_pa
     fs[-1] += to_hex(g, precision, line_len)
 
     write_files(fs, epoch)
-    write_addrs(fa, hl, bl)
+    write_addrs(epoch, fa, hl, bl)
 
 
 def write_files(fs, epoch):
     for i, data in enumerate(fs):
-        write_file(data, f'/content/epoch{epoch}_file{i+1}')
+        write_file(data, f'../output/epoch_{epoch}_file{i+1}')
 
 
-def write_addrs(fa, hl, bl):
-    writer = csv.writer(open('addrs.txt', 'w'), delimiter=',')
+def write_addrs(epoch, fa, hl, bl):
+    writer = csv.writer(open(f'../output/epoch_{epoch}_addrs.txt', 'w'), delimiter=',')
     writer.writerow(['addr', 'header_length', 'body_length'])
     for f in range(len(hl)):
         writer.writerow([f'file {f + 1}'])

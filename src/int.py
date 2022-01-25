@@ -1,6 +1,10 @@
 import numpy as np
 
 
+def divide(n, d):
+    return np.divide(n, d, out=np.zeros_like(n), where=d != 0)
+
+
 def aggregate(e, ifm):
     result = np.zeros_like(ifm)
     (ei, ev) = e
@@ -8,6 +12,12 @@ def aggregate(e, ifm):
         row, col = ei[0][i], ei[1][i]
         result[row] += ev[i] * ifm[col]
     return result
+
+
+def relu_grad(ifm, grad_ifm):
+    out = np.array(grad_ifm, copy=True)
+    out[ifm <= 0] = 0
+    return out
 
 
 def search_quantize(x, wl):
@@ -52,8 +62,9 @@ def i_dense(e, ifm, w, b, e_fl, ifm_fl, wfl, bfl, agg_fl, ofm_fl, relu, prune, p
     h = np.matmul(ifm, w, dtype=np.int64)
 
     if e is not None:
-        h = shift(h, ifm_fl + wfl - agg_fl, precision)
-        print(f'aggregation shift: {ifm_fl + wfl - agg_fl}')
+        aggregation_shift = ifm_fl + wfl - agg_fl
+        h = shift(h, aggregation_shift, precision)
+        print(f'aggregation shift: {aggregation_shift}')
         h = aggregate(e, h.astype(np.int64))
         bias_shift = bfl - e_fl - agg_fl
         combination_shift = e_fl + agg_fl - ofm_fl
@@ -69,3 +80,48 @@ def i_dense(e, ifm, w, b, e_fl, ifm_fl, wfl, bfl, agg_fl, ofm_fl, relu, prune, p
     if relu:
         return np.maximum(h, 0)
     return h
+
+
+def i_dense_grad(e, ifm, w, ofm, grad_ofm, efl, ifmfl, wfl, gafl, gifmfl, gwfl, gbfl, gofmfl, relu, prune, precision):
+    print(efl, ifmfl, wfl, gafl, gifmfl, gwfl, gbfl, gofmfl)
+    if relu:
+        grad_ofm = relu_grad(ofm, grad_ofm)
+    grad_b_shift = gofmfl - gbfl
+    print(f'grad bias shift: {grad_b_shift}')
+    grad_b = np.sum(grad_ofm, axis=0, dtype=np.int64)
+    grad_b = shift(grad_b, grad_b_shift, precision * 2)
+
+    h, hfl = grad_ofm, gofmfl
+    if e is not None:
+        h = aggregate(e, grad_ofm.astype(np.int64))
+        aggregation_shift = efl + gofmfl - gafl
+        print(f'aggregation shift: {aggregation_shift}')
+        h = shift(h, aggregation_shift, precision)
+        hfl = gafl
+
+    grad_w_shift = ifmfl + hfl - gwfl
+    print(f'grad weight shift: {grad_w_shift}')
+    grad_w = np.matmul(ifm.T, h, dtype=np.int64)
+    grad_w = shift(grad_w, grad_w_shift, precision)
+
+    grad_x_shift = hfl + wfl - gifmfl
+    print(f'grad ifm shift: {grad_x_shift}')
+    grad_x = np.matmul(h, w.T, dtype=np.int64)
+    grad_x = shift(grad_x, grad_x_shift, precision)
+
+    return grad_x, grad_w, grad_b
+
+
+def q_adam_update(x, m, v, g, eta, beta1, beta2, precision):
+    m = beta1 * m + (1 - beta1) * g
+    v = beta2 * v + (1 - beta2) * g ** 2
+    x, fl = search_quantize(x - eta * divide(m, np.sqrt(v)), precision)
+    return x, m, v, fl
+
+
+def i_adam_update(x, m, v, g, xfl, gfl, eta, beta1, beta2, precision):
+    x = x.astype(np.float64) / (2.0 ** xfl)
+    g = g.astype(np.float64) / (2.0 ** gfl)
+    x, m, v, fl = q_adam_update(x, m, v, g, eta, beta1, beta2, precision)
+    x = int_quantize(x, fl, precision)
+    return x, m, v
